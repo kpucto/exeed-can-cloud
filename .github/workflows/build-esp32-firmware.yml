@@ -1,0 +1,30 @@
+name: Build ESP32-S3 CAN firmware
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/can-decoder-lab
+    paths:
+      - "firmware/**"
+      - ".github/workflows/build-esp32-firmware.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PlatformIO Core
+        run: pip install -U platformio
+      - name: Build firmware
+        run: pio run -d firmware
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: exeed-can-router-v2-esp32s3
+          path: firmware/.pio/build/esp32s3/firmware.bin
+          if-no-files-found: error
+          retention-days: 30
