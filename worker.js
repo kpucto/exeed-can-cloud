@@ -1,7 +1,4 @@
 
-const DEVICE_TOKEN = "DEVICE_TOKEN";
-const VIEWER_TOKEN = "VIEWER_TOKEN";
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -18,24 +15,63 @@ export default {
     let role;
 
     if (path === "/device") {
-      const auth = request.headers.get("Authorization");
-      if (auth !== `Bearer ${env.DEVICE_TOKEN}`) {
-        return new Response("Unauthorized", { status: 401 });
+      const auth = request.headers.get("Authorization") || "";
+      const expected = env.DEVICE_TOKEN || "";
+
+      const hasHeader = auth.length > 0;
+      const hasBearer = auth.startsWith("Bearer ");
+      const receivedToken = hasBearer ? auth.slice(7) : "";
+
+      const matches =
+        expected.length > 0 &&
+        receivedToken === expected;
+
+      console.log("[AUTH] DEVICE request");
+      console.log("[AUTH] Header exists:", hasHeader);
+      console.log("[AUTH] Bearer prefix:", hasBearer);
+      console.log("[AUTH] Received token length:", receivedToken.length);
+      console.log("[AUTH] Expected token length:", expected.length);
+      console.log("[AUTH] Tokens match:", matches);
+
+      if (!matches) {
+        console.log("[AUTH] DEVICE AUTH FAILED");
+
+        return Response.json({
+          error: "Unauthorized",
+          diagnostic: {
+            headerExists: hasHeader,
+            bearerPrefix: hasBearer,
+            receivedLength: receivedToken.length,
+            expectedLength: expected.length,
+            tokensMatch: false
+          }
+        }, { status: 401 });
       }
+
+      console.log("[AUTH] DEVICE AUTH OK");
       role = "device";
+
     } else if (path === "/viewer") {
-      if (url.searchParams.get("token") !== env.VIEWER_TOKEN) {
+      const received = url.searchParams.get("token") || "";
+      const expected = env.VIEWER_TOKEN || "";
+
+      if (!expected || received !== expected) {
         return new Response("Unauthorized", { status: 401 });
       }
+
       role = "viewer";
+
     } else if (path === "/status") {
       role = "status";
+
     } else {
       return new Response("Not found", { status: 404 });
     }
 
-    if (role !== "status" &&
-        request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+    if (
+      role !== "status" &&
+      request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
+    ) {
       return new Response("WebSocket required", { status: 426 });
     }
 
@@ -43,7 +79,9 @@ export default {
     const stub = env.CAN_HUB.get(id);
 
     const internalUrl = new URL(request.url);
-    internalUrl.pathname = role === "status" ? "/status" : "/connect";
+    internalUrl.pathname =
+      role === "status" ? "/status" : "/connect";
+
     internalUrl.searchParams.set("role", role);
 
     return stub.fetch(new Request(internalUrl, request));
@@ -76,7 +114,9 @@ export class CanHub {
       return new Response("Not found", { status: 404 });
     }
 
-    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+    if (
+      request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
+    ) {
       return new Response("WebSocket required", { status: 426 });
     }
 
@@ -103,7 +143,6 @@ export class CanHub {
     const attachment = ws.deserializeAttachment();
     const role = attachment?.role;
 
-    // Браузер может только получать данные.
     if (role !== "device") {
       ws.close(1008, "Read only connection");
       return;
@@ -151,7 +190,7 @@ export class CanHub {
     }
   }
 
-  webSocketClose(ws, code, reason, wasClean) {
+  webSocketClose(ws, code, reason) {
     try {
       ws.close(code, reason);
     } catch {}
