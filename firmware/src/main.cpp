@@ -1,420 +1,126 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <WebSocketsClient.h>
-#include <Preferences.h>
-#include <time.h>
 #include <cstring>
 #include "driver/twai.h"
 
-// EXEED CAN ROUTER v2.0
-// ESP32-S3 / 500 kbit/s / TWAI LISTEN ONLY.
-// This firmware contains no CAN transmit calls.
-
-static constexpr gpio_num_t CAN_TX_PIN = GPIO_NUM_4;
-static constexpr gpio_num_t CAN_RX_PIN = GPIO_NUM_5;
-static constexpr size_t FRAME_BUFFER_SIZE = 400;
-static constexpr size_t ID_STATS_SIZE = 128;
-static constexpr uint32_t CLOUD_SEND_INTERVAL_MS = 50;
-static constexpr uint32_t STATUS_INTERVAL_MS = 5000;
-
-static const char *AP_SSID = "EXEED_CAN_ROUTER";
-static const char *AP_PASSWORD = "exeed123";
-static const char *CLOUD_HOST = "exeed-can-cloud.kpucto.workers.dev";
-static const uint16_t CLOUD_PORT = 443;
-static const char *CLOUD_PATH = "/device";
-
-static const char GTS_ROOT_R4[] PROGMEM = R"PEM(
------BEGIN CERTIFICATE-----
-MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD
-VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG
-A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw
-WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz
-IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi
-AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi
-QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR
-HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW
-BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D
-9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8
-p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD
------END CERTIFICATE-----
-)PEM";
-
+// EXEED CAN LAB v3.0: local-only passive CAN capture.
+// No cloud, no STA, no filesystem logging, no CAN transmit or diagnostics.
+static constexpr gpio_num_t CAN_TX_PIN=GPIO_NUM_4, CAN_RX_PIN=GPIO_NUM_5;
+static constexpr size_t FRAME_BUFFER_SIZE=512, ID_STATS_SIZE=128;
+static constexpr uint16_t API_FRAME_LIMIT=160;
+static const char *AP_SSID="EXEED_CAN_LAB", *AP_PASSWORD="exeed123";
 WebServer server(80);
-WebSocketsClient webSocket;
-Preferences prefs;
 
-struct CanFrame {
-  uint32_t seq = 0, id = 0, ts = 0;
-  uint8_t dlc = 0, data[8] = {};
-  bool extended = false, remote = false;
-};
-
+struct CanFrame { uint32_t seq=0,id=0,ts=0; uint8_t dlc=0,data[8]={}; bool ext=false,rtr=false; };
 struct IdStats {
-  bool used = false;
-  uint32_t id = 0, count = 0, firstSeen = 0, lastSeen = 0;
-  uint32_t lastPeriod = 0, minPeriod = UINT32_MAX, maxPeriod = 0;
-  uint8_t dlc = 0, lastData[8] = {};
-  uint32_t changedBytes[8] = {};
+  bool used=false,ext=false; uint32_t id=0,count=0,firstSeen=0,lastSeen=0,lastPeriod=0,minPeriod=UINT32_MAX,maxPeriod=0;
+  uint32_t changedBytes[8]={}; uint8_t dlc=0,lastData[8]={};
 };
+static CanFrame frames[FRAME_BUFFER_SIZE];
+static IdStats ids[ID_STATS_SIZE];
+static uint32_t totalFrames=0,rxErrors=0,txErrors=0,busErrors=0,rxMissed=0,rxOverrun=0,txFailed=0,lastStatus=0;
+static bool canReady=false; static String canState="NOT_STARTED";
 
-CanFrame frameBuffer[FRAME_BUFFER_SIZE];
-IdStats idStats[ID_STATS_SIZE];
-uint32_t totalFrames = 0, cloudLastSentSeq = 0;
-uint32_t rxErrors = 0, txErrors = 0, busErrors = 0, rxMissed = 0, rxOverrun = 0, txFailed = 0;
-uint32_t lastStatusAt = 0, lastCloudSendAt = 0, lastProbeAt = 0, lastSerialFrameAt = 0;
-uint32_t cloudSentBatches = 0, cloudSentFrames = 0;
-bool canReady = false, cloudReady = false, cloudStarted = false;
-bool ntpStarted = false, clockReady = false, probeSent = false;
-String wifiSsid, wifiPassword, canState = "NOT_STARTED";
-
-String hexId(uint32_t id, bool ext) {
-  char b[12];
-  snprintf(b, sizeof(b), ext ? "0x%08lX" : "0x%03lX", (unsigned long)id);
-  return String(b);
+static String stateName(twai_state_t s){switch(s){case TWAI_STATE_STOPPED:return "STOPPED";case TWAI_STATE_RUNNING:return "RUNNING";case TWAI_STATE_BUS_OFF:return "BUS_OFF";case TWAI_STATE_RECOVERING:return "RECOVERING";default:return "UNKNOWN";}}
+static IdStats* findId(uint32_t id,bool ext){
+  IdStats *slot=nullptr;
+  for(size_t i=0;i<ID_STATS_SIZE;i++){if(ids[i].used&&ids[i].id==id&&ids[i].ext==ext)return &ids[i];if(!ids[i].used&&!slot)slot=&ids[i];}
+  if(!slot){slot=&ids[0];for(size_t i=1;i<ID_STATS_SIZE;i++)if((int32_t)(ids[i].lastSeen-slot->lastSeen)<0)slot=&ids[i];*slot=IdStats{};}
+  slot->used=true;slot->id=id;slot->ext=ext;slot->firstSeen=millis();return slot;
+}
+static void saveFrame(const twai_message_t&m){
+  uint32_t now=millis();CanFrame&f=frames[totalFrames%FRAME_BUFFER_SIZE];f.seq=++totalFrames;f.id=m.identifier;f.ts=now;f.dlc=min((uint8_t)m.data_length_code,(uint8_t)8);f.ext=m.extd;f.rtr=m.rtr;
+  for(uint8_t i=0;i<8;i++)f.data[i]=(i<f.dlc&&!f.rtr)?m.data[i]:0;
+  IdStats*s=findId(f.id,f.ext);if(s->count){s->lastPeriod=now-s->lastSeen;s->minPeriod=min(s->minPeriod,s->lastPeriod);s->maxPeriod=max(s->maxPeriod,s->lastPeriod);for(uint8_t i=0;i<f.dlc;i++)if(s->lastData[i]!=f.data[i])s->changedBytes[i]++;}
+  s->count++;s->lastSeen=now;s->dlc=f.dlc;memcpy(s->lastData,f.data,8);
+}
+static void receiveCAN(){if(!canReady)return;twai_message_t m={};for(uint16_t i=0;i<250;i++){if(twai_receive(&m,0)!=ESP_OK)break;saveFrame(m);}}
+static void updateCANStatus(){if(!canReady)return;twai_status_info_t s={};if(twai_get_status_info(&s)==ESP_OK){canState=stateName(s.state);rxErrors=s.rx_error_counter;txErrors=s.tx_error_counter;busErrors=s.bus_error_count;rxMissed=s.rx_missed_count;rxOverrun=s.rx_overrun_count;txFailed=s.tx_failed_count;}}
+static bool initializeCAN(){
+  twai_general_config_t g=TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN,CAN_RX_PIN,TWAI_MODE_LISTEN_ONLY);g.rx_queue_len=1000;g.tx_queue_len=0;g.alerts_enabled=TWAI_ALERT_ALL;
+  twai_timing_config_t t=TWAI_TIMING_CONFIG_500KBITS();twai_filter_config_t f=TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  esp_err_t e=twai_driver_install(&g,&t,&f);if(e!=ESP_OK){Serial.printf("[CAN] install: %s\n",esp_err_to_name(e));return false;}
+  e=twai_start();if(e!=ESP_OK){Serial.printf("[CAN] start: %s\n",esp_err_to_name(e));twai_driver_uninstall();return false;}
+  Serial.println("[CAN] LISTEN ONLY active; TX queue disabled");return true;
 }
 
-String stateName(twai_state_t s) {
-  switch (s) {
-    case TWAI_STATE_STOPPED: return "STOPPED";
-    case TWAI_STATE_RUNNING: return "RUNNING";
-    case TWAI_STATE_BUS_OFF: return "BUS_OFF";
-    case TWAI_STATE_RECOVERING: return "RECOVERING";
-    default: return "UNKNOWN";
-  }
-}
-
-IdStats *findIdStats(uint32_t id) {
-  IdStats *freeSlot = nullptr;
-  for (size_t i = 0; i < ID_STATS_SIZE; i++) {
-    if (idStats[i].used && idStats[i].id == id) return &idStats[i];
-    if (!idStats[i].used && !freeSlot) freeSlot = &idStats[i];
-  }
-  if (!freeSlot) {
-    freeSlot = &idStats[0];
-    for (size_t i = 1; i < ID_STATS_SIZE; i++)
-      if (idStats[i].lastSeen < freeSlot->lastSeen) freeSlot = &idStats[i];
-    *freeSlot = IdStats{};
-  }
-  freeSlot->used = true;
-  freeSlot->id = id;
-  freeSlot->firstSeen = millis();
-  return freeSlot;
-}
-
-void saveFrame(const twai_message_t &msg) {
-  const uint32_t now = millis();
-  CanFrame &f = frameBuffer[totalFrames % FRAME_BUFFER_SIZE];
-  f.seq = ++totalFrames;
-  f.id = msg.identifier;
-  f.ts = now;
-  f.dlc = min((uint8_t)msg.data_length_code, (uint8_t)8);
-  f.extended = msg.extd;
-  f.remote = msg.rtr;
-  for (uint8_t i = 0; i < 8; i++) f.data[i] = (i < f.dlc && !f.remote) ? msg.data[i] : 0;
-
-  IdStats *s = findIdStats(f.id);
-  if (s->count) {
-    s->lastPeriod = now - s->lastSeen;
-    s->minPeriod = min(s->minPeriod, s->lastPeriod);
-    s->maxPeriod = max(s->maxPeriod, s->lastPeriod);
-    for (uint8_t i = 0; i < f.dlc; i++)
-      if (s->lastData[i] != f.data[i]) s->changedBytes[i]++;
-  }
-  s->count++;
-  s->lastSeen = now;
-  s->dlc = f.dlc;
-  memcpy(s->lastData, f.data, 8);
-
-  if (totalFrames <= 20 || now - lastSerialFrameAt >= 1000) {
-    lastSerialFrameAt = now;
-    Serial.printf("[CAN RX] #%lu ID=%s DLC=%u DATA=",
-      (unsigned long)f.seq, hexId(f.id, f.extended).c_str(), f.dlc);
-    for (uint8_t i = 0; i < f.dlc; i++) Serial.printf("%02X ", f.data[i]);
-    Serial.printf("%s%s\n", f.extended ? " EXT" : " STD", f.remote ? " RTR" : "");
-  }
-}
-
-void receiveCAN() {
-  if (!canReady) return;
-  twai_message_t msg = {};
-  for (uint16_t i = 0; i < 250; i++) {
-    if (twai_receive(&msg, 0) != ESP_OK) break;
-    saveFrame(msg);
-  }
-}
-
-void updateCANStatus() {
-  if (!canReady) return;
-  twai_status_info_t s = {};
-  if (twai_get_status_info(&s) == ESP_OK) {
-    canState = stateName(s.state);
-    rxErrors = s.rx_error_counter;
-    txErrors = s.tx_error_counter;
-    busErrors = s.bus_error_count;
-    rxMissed = s.rx_missed_count;
-    rxOverrun = s.rx_overrun_count;
-    txFailed = s.tx_failed_count;
-  }
-}
-
-bool initializeCAN() {
-  Serial.println("[CAN] TWAI install: 500 kbit/s, LISTEN ONLY");
-  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
-  g.rx_queue_len = 1000;
-  g.tx_queue_len = 0;
-  g.alerts_enabled = TWAI_ALERT_ALL;
-  twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS();
-  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-  esp_err_t e = twai_driver_install(&g, &t, &f);
-  if (e != ESP_OK) {
-    Serial.printf("[CAN ERROR] install: %s\n", esp_err_to_name(e));
-    return false;
-  }
-  e = twai_start();
-  if (e != ESP_OK) {
-    Serial.printf("[CAN ERROR] start: %s\n", esp_err_to_name(e));
-    twai_driver_uninstall();
-    return false;
-  }
-  Serial.println("[CAN] RUNNING. TX queue disabled; no CAN transmit.");
-  return true;
-}
-
-void loadCredentials() {
-  prefs.begin("exeed-can", true);
-  wifiSsid = prefs.getString("ssid", "");
-  wifiPassword = prefs.getString("pass", "");
-  prefs.end();
-}
-
-void startWiFi() {
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  bool ap = WiFi.softAP(AP_SSID, AP_PASSWORD, 6, false, 4);
-  Serial.printf("[WIFI] Setup AP %s; IP=%s\n", ap ? "READY" : "FAILED", WiFi.softAPIP().toString().c_str());
-  loadCredentials();
-  if (wifiSsid.length()) {
-    Serial.printf("[WIFI] Connecting to saved network: %s\n", wifiSsid.c_str());
-    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
-  } else {
-    Serial.println("[WIFI] No saved network. Configure at http://192.168.4.1");
-  }
-}
-
-void updateClock() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (!ntpStarted) {
-    configTime(0, 0, "pool.ntp.org", "time.google.com");
-    ntpStarted = true;
-    Serial.println("[TIME] NTP started");
-  }
-  if (!clockReady && time(nullptr) > 1760000000) {
-    clockReady = true;
-    Serial.println("[TIME] Clock synchronized");
-  }
-}
-
-const char DASHBOARD_HTML[] PROGMEM = R"HTML(
-<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>EXEED CAN ROUTER</title><style>
-*{box-sizing:border-box}body{margin:0;background:#0b1220;color:#e8eef8;font:14px Arial;padding:15px}main{max-width:1250px;margin:auto}
-.card{background:#151f30;border:1px solid #29384d;border-radius:12px;padding:14px;margin:10px 0}
-h1{font-size:20px}.muted{color:#91a1b8}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}
-.big{font-size:25px;font-weight:bold;margin-top:8px}.good{color:#43dfa5}.bad{color:#ff7485}
-input,button{background:#0b1525;color:#e8eef8;border:1px solid #34465e;border-radius:7px;padding:10px}
-button{cursor:pointer}table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}
-th,td{text-align:left;padding:9px;border-bottom:1px solid #29384d}th{color:#91a1b8}.wrap{overflow:auto;max-height:420px}.id{color:#76b5ff;font-family:monospace}
-form{display:flex;gap:8px;flex-wrap:wrap}form input{min-width:180px;flex:1}
-@media(max-width:650px){.stats{grid-template-columns:repeat(2,1fr)}.big{font-size:21px}}
+static const char HTML[] PROGMEM=R"HTML(
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0a1020"><title>EXEED CAN LAB</title>
+<style>
+:root{color-scheme:dark;--bg:#0a1020;--p:#121d30;--p2:#0e1728;--line:#263750;--txt:#eaf1fc;--muted:#91a3bd;--blue:#73b7ff;--green:#42dfa5;--red:#ff7185;--amber:#ffc36e}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}main{max-width:1500px;margin:auto;padding:14px}
+header,.bar,.tabs,.stats,.toolbar{display:flex;gap:9px;flex-wrap:wrap;align-items:center;justify-content:space-between}h1{font-size:21px;margin:0}.muted,.hint{color:var(--muted)}.hint{line-height:1.45;font-size:12px}
+.card{background:var(--p);border:1px solid var(--line);border-radius:12px;padding:13px;margin:10px 0}.stats{display:grid;grid-template-columns:repeat(4,1fr)}
+.metric{font-size:24px;font-weight:750;margin-top:7px}.green{color:var(--green)}.red{color:var(--red)}
+input,select,button{background:var(--p2);color:var(--txt);border:1px solid #354965;border-radius:8px;padding:10px;font:inherit;min-height:39px}button{cursor:pointer;font-weight:650}button.primary,.active{background:#174d7e;border-color:#438bc8}
+.panel{display:none}.panel.active{display:block}.tablewrap{overflow:auto;max-height:430px;border:1px solid var(--line);border-radius:8px}table{width:100%;border-collapse:collapse;white-space:nowrap;font:12px ui-monospace,monospace}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}th{position:sticky;top:0;background:#17243a;color:var(--muted)}td.id{color:var(--blue)}.pill{border:1px solid var(--line);border-radius:20px;padding:4px 9px}.event{border-left:3px solid var(--amber);padding:7px 10px;margin:6px 0;background:#101a2b}
+@media(max-width:700px){main{padding:9px}.stats{grid-template-columns:repeat(2,1fr)}.metric{font-size:20px}h1{font-size:18px}}
 </style></head><body><main>
-<h1>EXEED CAN ROUTER v2.0</h1><p class="muted">ESP32-S3 · CAN 500 kbit/s · HARDWARE LISTEN ONLY</p>
-<div class="card"><b>Настройка Wi-Fi</b><p class="muted">Подключись к точке EXEED_CAN_ROUTER и введи SSID/пароль автомобильного модема.</p>
-<form method="POST" action="/wifi"><input name="ssid" placeholder="Wi-Fi SSID" required><input name="pass" type="password" placeholder="Wi-Fi пароль"><button>Сохранить и подключить</button></form></div>
+<header><div><h1>EXEED CAN LAB <span class="pill">v3.0 LOCAL</span></h1><div class="hint">ESP32-S3 · 500 kbit/s · пассивное чтение · без интернета</div></div><span class="pill" id="link">Соединение…</span></header>
 <section class="stats">
-<div class="card"><div class="muted">CAN state</div><div class="big" id="can">...</div></div>
-<div class="card"><div class="muted">Всего кадров</div><div class="big" id="frames">0</div></div>
-<div class="card"><div class="muted">Уникальных ID</div><div class="big" id="ids">0</div></div>
-<div class="card"><div class="muted">Cloud WSS</div><div class="big" id="cloud">OFFLINE</div></div></section>
-<div class="card"><b>Ошибки и соединение</b><p id="errors" class="muted">Ожидание...</p><p id="wifiState" class="muted"></p></div>
-<div class="card"><b>Последние CAN-кадры</b><div class="wrap"><table><thead><tr><th>Время, ms</th><th>ID</th><th>Тип</th><th>DLC</th><th>DATA</th></tr></thead><tbody id="log"><tr><td colspan="5">Ожидание...</td></tr></tbody></table></div></div>
-<div class="card"><b>CAN ID inventory</b><div class="wrap"><table><thead><tr><th>ID</th><th>Кадров</th><th>Период, ms</th><th>Мин/макс, ms</th><th>DLC</th><th>Последние данные</th></tr></thead><tbody id="inventory"></tbody></table></div></div>
-</main><script>
-let seq=0;const $=id=>document.getElementById(id);
-function hx(n){return "0x"+Number(n).toString(16).toUpperCase().padStart(3,"0")}
-async function poll(){try{const r=await fetch("/api/data?since="+seq,{cache:"no-store"}),d=await r.json();
-$("can").textContent=d.canState;$("can").className="big "+(d.canState==="RUNNING"?"good":"bad");
-$("frames").textContent=d.frames;$("ids").textContent=d.uniqueIds;$("cloud").textContent=d.cloud?"ONLINE":"OFFLINE";$("cloud").className="big "+(d.cloud?"good":"bad");
-$("errors").textContent="RX "+d.rxErrors+" · TX "+d.txErrors+" · BUS "+d.busErrors+" · MISSED "+d.rxMissed+" · OVERRUN "+d.rxOverrun+" · TX FAILED "+d.txFailed+" · TWAI "+d.canState;
-$("wifiState").textContent="Wi-Fi "+(d.sta?"CONNECTED":"OFFLINE")+" · Cloud sent "+d.cloudSentFrames+" frames / "+d.cloudSentBatches+" batches";
-const log=$("log");for(const f of d.framesList){if(f.seq<=seq)continue;const tr=document.createElement("tr");[f.ts,hx(f.id),f.type,f.dlc,f.data].forEach(v=>{const td=document.createElement("td");td.textContent=v;tr.appendChild(td)});log.prepend(tr);while(log.children.length>80)log.lastChild.remove();seq=Math.max(seq,f.seq)}
-$("inventory").innerHTML=d.inventory.map(x=>"<tr><td class='id'>"+hx(x.id)+"</td><td>"+x.count+"</td><td>"+x.period+"</td><td>"+x.min+"/"+x.max+"</td><td>"+x.dlc+"</td><td>"+x.data+"</td></tr>").join("");
-}catch(e){console.error(e)}}setInterval(poll,500);poll();
+<div class="card"><div class="muted">CAN</div><div class="metric" id="can">…</div></div><div class="card"><div class="muted">Всего кадров</div><div class="metric" id="total">0</div></div>
+<div class="card"><div class="muted">Уникальных ID</div><div class="metric" id="unique">0</div></div><div class="card"><div class="muted">Кадров в браузере</div><div class="metric" id="client">0</div></div></section>
+<div class="card"><div id="errors" class="bar">Ожидание статистики…</div><p class="hint">RAM ESP32: 512 кадров. Браузер iPad: до 12 000 кадров текущей сессии. На флеш платы ничего не записывается.</p><div class="bar hint"><span>Потеряно в буфере платы: <b id="lost">0</b></span><span>Потеряно при опросе: <b id="gap">0</b></span><span>Скорость: <b id="rate">0</b> кадр/с</span></div></div>
+<nav class="tabs"><button class="tab active" data-tab="live">CAN монитор</button><button class="tab" data-tab="ids">ID анализатор</button><button class="tab" data-tab="lab">Эксперименты</button><button class="tab" data-tab="export">Экспорт</button></nav>
+<section class="panel active" id="p-live"><div class="card"><div class="toolbar"><input id="fid" placeholder="Фильтр ID, например 0x123" style="flex:1"><input id="fdata" placeholder="Поиск DATA" style="flex:1"><select id="ftype"><option value="ALL">Все кадры</option><option>STD</option><option>EXT</option></select><button id="pause">Пауза отображения</button><button id="clearview">Очистить экран</button></div><p class="hint">Пауза останавливает только отображение, сбор сессии продолжается.</p><div class="tablewrap"><table><thead><tr><th>Seq</th><th>Uptime ms</th><th>ID</th><th>Тип</th><th>DLC</th><th>DATA</th></tr></thead><tbody id="log"><tr><td colspan="6">Ожидание кадров…</td></tr></tbody></table></div></div></section>
+<section class="panel" id="p-ids"><div class="card"><div class="toolbar"><input id="idq" placeholder="Поиск ID/метки" style="flex:1"><select id="sort"><option value="count">По количеству</option><option value="period">По периоду</option><option value="changes">По изменяемости</option><option value="id">По ID</option></select></div><div class="tablewrap"><table><thead><tr><th>ID</th><th>Тип</th><th>Кадров</th><th>Период</th><th>Min/Max</th><th>Байты изменялись</th><th>Последние данные</th><th>Метка (редактируется)</th></tr></thead><tbody id="inventory"></tbody></table></div><p class="hint">Нажми ID, чтобы отфильтровать монитор. Названия ID сохраняются только в локальном браузере iPad.</p></div></section>
+<section class="panel" id="p-lab">
+<div class="card"><b>Метки действий</b><p class="hint">Ставь метку непосредственно перед или после изменения одной настройки: A/C, температура, вентилятор, направление обдува, обогрев.</p><div class="toolbar"><input id="eventname" placeholder="Например: Климат включён" style="flex:1"><button class="primary" id="mark">Добавить метку</button></div><div id="events"></div></div>
+<div class="card"><b>Сравнение A/B</b><p class="hint">A фиксируй перед действием, B после него. Сравнение анализирует окно A→B и окно B→текущий момент.</p><div class="toolbar"><button id="seta">Зафиксировать A</button><button id="setb">Зафиксировать B</button><button class="primary" id="compare">Сравнить</button><button id="resetab">Сбросить</button></div><p class="hint" id="abstatus">Точки не установлены.</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>Кадров A/B</th><th>DATA A</th><th>DATA B</th><th>Изменения</th></tr></thead><tbody id="ab"></tbody></table></div></div>
+<div class="card"><button id="clearsession">Очистить сессию браузера</button> <span class="hint">Очищает только данные текущей вкладки.</span></div></section>
+<section class="panel" id="p-export"><div class="card"><b>Экспорт на iPad</b><p class="hint">Файл формируется на iPad из данных текущей сессии. Ничего не скачивается автоматически и не сохраняется на ESP32.</p><p>Кадров: <b id="ecount">0</b> · Меток: <b id="evcount">0</b></p><div class="toolbar"><button class="primary" id="csv">Скачать CSV</button><button id="json">Скачать JSON</button></div></div></section>
+<p class="hint">READ ONLY · TWAI LISTEN ONLY · CAN TX disabled · CAN FD не поддерживается.</p></main>
+<script>
+"use strict";
+const $=id=>document.getElementById(id),S={seq:0,frames:[],events:[],inventory:[],paused:false,A:null,B:null,gap:0,labels:JSON.parse(localStorage.getItem("exeedCanLabels")||"{}"),rate:0,rateAt:Date.now(),rateCount:0};
+const MAX=12000,pad=(n,w=2)=>Number(n).toString(16).toUpperCase().padStart(w,"0"),key=x=>(x.ext?"EXT":"STD")+":0x"+pad(x.id,x.ext?8:3),data=f=>f.data.map(v=>pad(v)).join(" ");
+function switchTab(t){document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.tab===t));document.querySelectorAll(".panel").forEach(p=>p.classList.toggle("active",p.id==="p-"+t));}
+document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
+function parseHex(s){s=s.trim().toLowerCase().replace(/^0x/,"");return s?(/^[0-9a-f]+$/.test(s)?parseInt(s,16):NaN):null;}
+function addFrame(f){S.frames.push(f);if(S.frames.length>MAX)S.frames.splice(0,S.frames.length-MAX);}
+function counts(){$("client").textContent=S.frames.length.toLocaleString();$("ecount").textContent=S.frames.length;$("evcount").textContent=S.events.length;}
+function drawLog(){if(S.paused)return;const q=parseHex($("fid").value),d=$("fdata").value.replace(/\s/g,"").toUpperCase(),t=$("ftype").value;const list=S.frames.slice(-250).reverse().filter(f=>(q===null||(!Number.isNaN(q)&&f.id===q))&&(t==="ALL"||f.ext===(t==="EXT"))&&(!d||data(f).replace(/\s/g,"").includes(d)));const b=$("log");b.textContent="";for(const f of list){const tr=document.createElement("tr");[f.seq,f.ts,key(f),f.ext?"EXT":"STD",f.dlc,data(f)+(f.rtr?" RTR":"")].forEach((v,i)=>{const td=document.createElement("td");td.textContent=v;if(i===2)td.className="id";tr.appendChild(td)});b.appendChild(tr);}if(!list.length)b.innerHTML="<tr><td colspan='6'>Нет кадров по фильтру</td></tr>";}
+function drawInventory(){const q=$("idq").value.toLowerCase(),sort=$("sort").value;let a=S.inventory.filter(x=>key(x).toLowerCase().includes(q)||(S.labels[key(x)]||"").toLowerCase().includes(q));a.sort((x,y)=>sort==="id"?x.id-y.id:sort==="period"?x.period-y.period:sort==="changes"?y.changed-x.changed:y.count-x.count);const b=$("inventory");b.textContent="";for(const x of a){const tr=document.createElement("tr"),k=key(x),vals=[k,x.ext?"EXT":"STD",x.count,x.period+" ms",x.min+"/"+x.max+" ms",x.changedBytes.join(", "),x.data.map(v=>pad(v)).join(" ")];vals.forEach((v,i)=>{const td=document.createElement("td");td.textContent=v;if(i===0){td.className="id";td.onclick=()=>{$("fid").value="0x"+pad(x.id,x.ext?8:3);switchTab("live");drawLog();};}tr.appendChild(td);});const td=document.createElement("td");td.contentEditable="true";td.textContent=S.labels[k]||"";td.onblur=()=>{S.labels[k]=td.textContent.trim();localStorage.setItem("exeedCanLabels",JSON.stringify(S.labels));};tr.appendChild(td);b.appendChild(tr);}}
+function drawEvents(){const b=$("events");b.textContent="";S.events.forEach(e=>{const d=document.createElement("div");d.className="event";d.textContent=new Date(e.wall).toLocaleTimeString()+" · "+e.label+" · seq "+e.seq;b.appendChild(d);});}
+function mark(label){if(!label)return;S.events.push({label,wall:new Date().toISOString(),seq:S.seq,index:S.frames.length});drawEvents();counts();}
+function point(){return {index:S.frames.length,seq:S.seq,wall:new Date().toISOString()};}
+function summarize(start,end){const m=new Map();for(const f of S.frames.slice(start,end)){const k=key(f);let x=m.get(k);if(!x){x={id:f.id,ext:f.ext,count:0,last:null};m.set(k,x);}x.count++;x.last=f;}return m;}
+function compare(){if(!S.A||!S.B){$("abstatus").textContent="Установи точки A и B.";return;}const a=summarize(S.A.index,S.B.index),b=summarize(S.B.index,S.frames.length),keys=new Set([...a.keys(),...b.keys()]),rows=[];for(const k of keys){const x=a.get(k),y=b.get(k),r=y||x,changes=[];for(let i=0;i<8;i++){const av=x?.last?.data[i],bv=y?.last?.data[i];if(av!==bv&&(av!==undefined||bv!==undefined))changes.push("B"+i);}if(!x||!y||changes.length)rows.push({r,x,y,changes});}rows.sort((x,y)=>y.changes.length-x.changes.length||(y.y?.count||0)-(x.y?.count||0));$("ab").textContent="";rows.forEach(z=>{const tr=document.createElement("tr");[key(z.r),(z.x?.count||0)+" / "+(z.y?.count||0),z.x?data(z.x.last):"нет",z.y?data(z.y.last):"нет",z.changes.join(", ")||"ID появился/исчез"].forEach(v=>{const td=document.createElement("td");td.textContent=v;tr.appendChild(td)});$("ab").appendChild(tr);});$("abstatus").textContent="A: seq "+S.A.seq+" · B: seq "+S.B.seq+" · строк: "+rows.length;}
+function download(name,type,content){const u=URL.createObjectURL(new Blob([content],{type})),a=document.createElement("a");a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1500);}
+function exportRows(){return S.frames.map(f=>({seq:f.seq,uptime_ms:f.ts,id:"0x"+pad(f.id,f.ext?8:3),format:f.ext?"EXT":"STD",dlc:f.dlc,data:data(f),remote:f.rtr}));}
+$("csv").onclick=()=>{const h=["seq","uptime_ms","id","format","dlc","data","remote"],q=v=>'"'+String(v??"").replace(/"/g,'""')+'"',rows=exportRows(),csv=[h.join(","),...rows.map(r=>h.map(k=>q(r[k])).join(","))].join("\r\n");download("exeed-can-"+new Date().toISOString().replace(/[:.]/g,"-")+".csv","text/csv;charset=utf-8","\uFEFF"+csv);};
+$("json").onclick=()=>download("exeed-can-"+new Date().toISOString().replace(/[:.]/g,"-")+".json","application/json",JSON.stringify({createdAt:new Date().toISOString(),frames:exportRows(),events:S.events,pointA:S.A,pointB:S.B,inventory:S.inventory},null,2));
+$("pause").onclick=()=>{S.paused=!S.paused;$("pause").textContent=S.paused?"Продолжить":"Пауза отображения";if(!S.paused)drawLog();};
+$("clearview").onclick=()=>$("log").textContent="";["fid","fdata"].forEach(id=>$(id).oninput=drawLog);$("ftype").onchange=drawLog;$("idq").oninput=drawInventory;$("sort").onchange=drawInventory;
+$("mark").onclick=()=>{mark($("eventname").value.trim());$("eventname").value="";};$("seta").onclick=()=>{S.A=point();$("abstatus").textContent="Точка A установлена, seq "+S.A.seq;};$("setb").onclick=()=>{S.B=point();$("abstatus").textContent="Точка B установлена, seq "+S.B.seq;};$("compare").onclick=compare;
+$("resetab").onclick=()=>{S.A=S.B=null;$("ab").textContent="";$("abstatus").textContent="Точки сброшены.";};
+$("clearsession").onclick=()=>{if(confirm("Очистить текущую сессию в браузере?")){S.frames=[];S.events=[];S.A=S.B=null;S.seq=0;S.gap=0;counts();drawEvents();drawLog();$("ab").textContent="";}};
+async function poll(){try{const r=await fetch("/api/data?since="+S.seq,{cache:"no-store"});if(!r.ok)throw Error("HTTP "+r.status);const d=await r.json();$("link").textContent="ESP32 · "+location.host;$("link").className="pill green";$("can").textContent=d.canState;$("can").className="metric "+(d.canState==="RUNNING"?"green":"red");$("total").textContent=d.totalFrames.toLocaleString();$("unique").textContent=d.uniqueIds;$("errors").textContent="RX "+d.rxErrors+" · TX "+d.txErrors+" · BUS "+d.busErrors+" · MISSED "+d.rxMissed+" · OVERRUN "+d.rxOverrun+" · TX FAILED "+d.txFailed;$("lost").textContent=d.boardLost.toLocaleString();S.gap+=d.gap;$("gap").textContent=S.gap.toLocaleString();d.framesList.forEach(f=>{addFrame(f);S.seq=Math.max(S.seq,f.seq);});S.inventory=d.inventory;const now=Date.now();if(now-S.rateAt>=1000){S.rate=(S.frames.length-S.rateCount)*1000/(now-S.rateAt);S.rateCount=S.frames.length;S.rateAt=now;}$("rate").textContent=S.rate.toFixed(1);counts();drawInventory();if(!S.paused)drawLog();}catch(e){$("link").textContent="Нет связи с ESP32";$("link").className="pill red";}}
+setInterval(poll,180);poll();
 </script></body></html>
 )HTML";
 
-void handleRoot() { server.send_P(200, "text/html; charset=utf-8", DASHBOARD_HTML); }
-
-void handleWiFiSave() {
-  String ssid = server.arg("ssid"); String pass = server.arg("pass"); ssid.trim();
-  if (!ssid.length()) { server.send(400, "text/plain", "SSID required"); return; }
-  prefs.begin("exeed-can", false); prefs.putString("ssid", ssid); prefs.putString("pass", pass); prefs.end();
-  server.send(200, "text/html; charset=utf-8", "<meta charset='utf-8'><p>Wi-Fi сохранён. ESP32 перезапускается...</p>");
-  delay(700); ESP.restart();
+static void handleRoot(){server.send_P(200,"text/html; charset=utf-8",HTML);}
+static void handleApi(){
+  updateCANStatus();uint32_t since=server.hasArg("since")?strtoul(server.arg("since").c_str(),nullptr,10):0;
+  uint32_t oldest=totalFrames>FRAME_BUFFER_SIZE?totalFrames-FRAME_BUFFER_SIZE+1:(totalFrames?1:0);
+  uint32_t lost=(oldest&&since+1<oldest)?oldest-since-1:0,start=since+1,end=totalFrames;
+  if(oldest&&start<oldest)start=oldest;if(end>=start&&end-start+1>API_FRAME_LIMIT)start=end-API_FRAME_LIMIT+1;
+  uint32_t unique=0;for(const auto&s:ids)if(s.used)unique++;
+  String out;out.reserve(26000);
+  out="{\"canState\":\""+canState+"\",\"totalFrames\":"+String(totalFrames)+",\"uniqueIds\":"+String(unique)+",\"boardLost\":"+String(lost)+",\"gap\":"+String(lost)+
+    ",\"rxErrors\":"+String(rxErrors)+",\"txErrors\":"+String(txErrors)+",\"busErrors\":"+String(busErrors)+",\"rxMissed\":"+String(rxMissed)+",\"rxOverrun\":"+String(rxOverrun)+",\"txFailed\":"+String(txFailed)+",\"framesList\":[";
+  bool first=true;for(uint32_t seq=start;seq<=end&&seq;seq++){const CanFrame&f=frames[(seq-1)%FRAME_BUFFER_SIZE];if(f.seq!=seq)continue;if(!first)out+=",";first=false;
+    out+="{\"seq\":"+String(f.seq)+",\"ts\":"+String(f.ts)+",\"id\":"+String(f.id)+",\"dlc\":"+String(f.dlc)+",\"ext\":"+String(f.ext?"true":"false")+",\"rtr\":"+String(f.rtr?"true":"false")+",\"data\":[";
+    for(uint8_t i=0;i<f.dlc;i++){if(i)out+=",";out+=String(f.data[i]);}out+="]}";}
+  out+="],\"inventory\":[";first=true;for(const auto&s:ids){if(!s.used)continue;if(!first)out+=",";first=false;uint32_t changed=0;
+    out+="{\"id\":"+String(s.id)+",\"ext\":"+String(s.ext?"true":"false")+",\"count\":"+String(s.count)+",\"period\":"+String(s.lastPeriod)+",\"min\":"+String(s.minPeriod==UINT32_MAX?0:s.minPeriod)+",\"max\":"+String(s.maxPeriod)+",\"dlc\":"+String(s.dlc)+",\"changedBytes\":[";
+    for(uint8_t i=0;i<8;i++){if(i)out+=",";out+=String(s.changedBytes[i]);if(s.changedBytes[i])changed++;}out+="],\"changed\":"+String(changed)+",\"data\":[";
+    for(uint8_t i=0;i<s.dlc;i++){if(i)out+=",";out+=String(s.lastData[i]);}out+="]}";}
+  out+="]}";server.sendHeader("Cache-Control","no-store");server.send(200,"application/json; charset=utf-8",out);
 }
-
-void handleApiData() {
-  updateCANStatus();
-  uint32_t since = server.hasArg("since") ? strtoul(server.arg("since").c_str(), nullptr, 10) : 0;
-  String out; out.reserve(24000);
-  uint32_t uniqueIds = 0; for (const auto &s : idStats) if (s.used) uniqueIds++;
-  out = "{\"canState\":\"" + canState + "\",\"frames\":" + String(totalFrames) +
-    ",\"uniqueIds\":" + String(uniqueIds) +
-    ",\"sta\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") +
-    ",\"cloud\":" + String(cloudReady ? "true" : "false") +
-    ",\"rxErrors\":" + String(rxErrors) + ",\"txErrors\":" + String(txErrors) +
-    ",\"busErrors\":" + String(busErrors) + ",\"rxMissed\":" + String(rxMissed) +
-    ",\"rxOverrun\":" + String(rxOverrun) + ",\"txFailed\":" + String(txFailed) +
-    ",\"cloudSentFrames\":" + String(cloudSentFrames) +
-    ",\"cloudSentBatches\":" + String(cloudSentBatches) + ",\"framesList\":[";
-  bool first = true;
-  uint32_t oldest = totalFrames > FRAME_BUFFER_SIZE ? totalFrames - FRAME_BUFFER_SIZE + 1 : 1;
-  for (uint32_t seq = oldest; seq <= totalFrames; seq++) {
-    if (seq <= since) continue;
-    const CanFrame &f = frameBuffer[(seq - 1) % FRAME_BUFFER_SIZE];
-    if (f.seq != seq) continue;
-    if (!first) out += ","; first = false;
-    out += "{\"seq\":" + String(f.seq) + ",\"ts\":" + String(f.ts) +
-      ",\"id\":" + String(f.id) + ",\"dlc\":" + String(f.dlc) +
-      ",\"type\":\"" + String(f.extended ? "EXT" : "STD") + "\",\"data\":\"";
-    for (uint8_t i = 0; i < f.dlc; i++) { if (i) out += " "; if (f.data[i] < 16) out += "0"; out += String(f.data[i], HEX); }
-    out += "\"}";
-  }
-  out += "],\"inventory\":["; first = true;
-  for (const auto &s : idStats) {
-    if (!s.used) continue;
-    if (!first) out += ","; first = false;
-    uint32_t minP = s.minPeriod == UINT32_MAX ? 0 : s.minPeriod;
-    out += "{\"id\":" + String(s.id) + ",\"count\":" + String(s.count) +
-      ",\"period\":" + String(s.lastPeriod) + ",\"min\":" + String(minP) +
-      ",\"max\":" + String(s.maxPeriod) + ",\"dlc\":" + String(s.dlc) + ",\"data\":\"";
-    for (uint8_t i = 0; i < s.dlc; i++) { if (i) out += " "; if (s.lastData[i] < 16) out += "0"; out += String(s.lastData[i], HEX); }
-    out += "\"}";
-  }
-  out += "]}";
-  server.send(200, "application/json", out);
-}
-
-void startWebServer() {
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/wifi", HTTP_POST, handleWiFiSave);
-  server.on("/api/data", HTTP_GET, handleApiData);
-  server.on("/favicon.ico", HTTP_GET, [](){ server.send(204); });
-  server.begin();
-  Serial.println("[WEB] Dashboard: http://192.168.4.1");
-}
-
-void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
-  switch (type) {
-    case WStype_CONNECTED: cloudReady = true; probeSent = false; Serial.println("[WSS] Connected to Cloudflare /device"); break;
-    case WStype_DISCONNECTED: cloudReady = false; probeSent = false; Serial.println("[WSS] Disconnected; reconnect enabled"); break;
-    case WStype_ERROR: cloudReady = false; Serial.println("[WSS] Socket error"); break;
-    case WStype_TEXT: Serial.printf("[WSS] Server: %.*s\n", (int)length, (const char*)payload); break;
-    default: break;
-  }
-}
-
-void startCloudIfReady() {
-  if (cloudStarted || WiFi.status() != WL_CONNECTED || !clockReady) return;
-  Serial.println("[CLOUD] Starting TLS WebSocket...");
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
-  webSocket.enableHeartbeat(15000, 3000, 2);
-  webSocket.beginSslWithCA(CLOUD_HOST, CLOUD_PORT, CLOUD_PATH, GTS_ROOT_R4);
-  cloudStarted = true;
-}
-
-void sendCloudProbe() {
-  if (!cloudReady || !webSocket.isConnected()) return;
-  if (probeSent && millis() - lastProbeAt < 15000) return;
-  if (webSocket.sendTXT("{\"type\":\"frames\",\"frames\":[]}")) {
-    probeSent = true; lastProbeAt = millis();
-    Serial.println("[CLOUD] Link heartbeat sent; CAN frame count in probe=0");
-  }
-}
-
-void sendCloudFrames() {
-  if (!cloudReady || !webSocket.isConnected() || !totalFrames) return;
-  if (millis() - lastCloudSendAt < CLOUD_SEND_INTERVAL_MS) return;
-  lastCloudSendAt = millis();
-  uint32_t oldest = totalFrames > FRAME_BUFFER_SIZE ? totalFrames - FRAME_BUFFER_SIZE + 1 : 1;
-  uint32_t nextSeq = max(cloudLastSentSeq + 1, oldest);
-  if (nextSeq > totalFrames) return;
-
-  String packet; packet.reserve(5000); packet = "{\"type\":\"frames\",\"frames\":[";
-  bool first = true; uint32_t sentThrough = cloudLastSentSeq; uint16_t count = 0;
-  for (uint32_t seq = nextSeq; seq <= totalFrames && count < 25; seq++) {
-    const CanFrame &f = frameBuffer[(seq - 1) % FRAME_BUFFER_SIZE];
-    if (f.seq != seq) continue;
-    if (!first) packet += ","; first = false;
-    packet += "{\"seq\":" + String(f.seq) + ",\"ts\":" + String(f.ts) +
-      ",\"id\":" + String(f.id) + ",\"dlc\":" + String(f.dlc) +
-      ",\"ext\":" + String(f.extended ? "true" : "false") +
-      ",\"rtr\":" + String(f.remote ? "true" : "false") + ",\"data\":[";
-    for (uint8_t i = 0; i < f.dlc; i++) { if (i) packet += ","; packet += String(f.data[i]); }
-    packet += "]}"; sentThrough = seq; count++;
-  }
-  packet += "]}";
-  if (count && webSocket.sendTXT(packet)) {
-    cloudLastSentSeq = sentThrough; cloudSentFrames += count; cloudSentBatches++;
-    Serial.printf("[CLOUD] Sent %u frames; total=%lu\n", count, (unsigned long)cloudSentFrames);
-  } else if (count) Serial.println("[CLOUD ERROR] sendTXT failed");
-}
-
-void printStatus() {
-  updateCANStatus();
-  uint32_t ids = 0; for (const auto &s : idStats) if (s.used) ids++;
-  Serial.println("\n========== EXEED CAN ROUTER v2.0 ==========");
-  Serial.printf("CAN=%s frames=%lu uniqueIDs=%lu\n", canState.c_str(), (unsigned long)totalFrames, (unsigned long)ids);
-  Serial.printf("TWAI RX=%lu TX=%lu BUS=%lu MISSED=%lu OVERRUN=%lu TX_FAILED=%lu\n",
-    (unsigned long)rxErrors, (unsigned long)txErrors, (unsigned long)busErrors,
-    (unsigned long)rxMissed, (unsigned long)rxOverrun, (unsigned long)txFailed);
-  Serial.printf("Wi-Fi=%s IP=%s Cloud=%s sentFrames=%lu\n",
-    WiFi.status() == WL_CONNECTED ? "CONNECTED" : "OFFLINE",
-    WiFi.localIP().toString().c_str(), cloudReady ? "CONNECTED" : "OFFLINE",
-    (unsigned long)cloudSentFrames);
-  Serial.println("MODE=LISTEN ONLY; CAN TRANSMIT=DISABLED");
-  Serial.println("============================================");
-}
-
-void setup() {
-  Serial.begin(115200); delay(1500);
-  Serial.println("\nEXEED CAN ROUTER v2.0 / ESP32-S3");
-  Serial.println("CAN 500 kbit/s / TWAI LISTEN ONLY / Cloudflare WSS");
-  canReady = initializeCAN();
-  startWiFi();
-  startWebServer();
-}
-
-void loop() {
-  server.handleClient();
-  receiveCAN();
-  if (WiFi.status() == WL_CONNECTED) {
-    updateClock();
-    startCloudIfReady();
-  } else {
-    clockReady = false;
-    ntpStarted = false;
-  }
-  if (cloudStarted) {
-    webSocket.loop();
-    sendCloudProbe();
-    sendCloudFrames();
-  }
-  if (millis() - lastStatusAt >= STATUS_INTERVAL_MS) {
-    lastStatusAt = millis();
-    printStatus();
-  }
-  delay(1);
-}
+static void startWiFi(){WiFi.mode(WIFI_AP);WiFi.setSleep(false);bool ok=WiFi.softAP(AP_SSID,AP_PASSWORD,6,false,4);Serial.printf("[WIFI] AP %s SSID=%s IP=%s\n",ok?"READY":"FAILED",AP_SSID,WiFi.softAPIP().toString().c_str());}
+static void printStatus(){updateCANStatus();uint32_t n=0;for(const auto&s:ids)if(s.used)n++;Serial.println("\n===== EXEED CAN LAB v3.0 =====");Serial.printf("CAN=%s frames=%lu uniqueIDs=%lu\n",canState.c_str(),(unsigned long)totalFrames,(unsigned long)n);Serial.printf("TWAI RX=%lu TX=%lu BUS=%lu MISSED=%lu OVERRUN=%lu TX_FAILED=%lu\n",(unsigned long)rxErrors,(unsigned long)txErrors,(unsigned long)busErrors,(unsigned long)rxMissed,(unsigned long)rxOverrun,(unsigned long)txFailed);Serial.printf("AP=%s IP=%s\n",AP_SSID,WiFi.softAPIP().toString().c_str());Serial.println("LISTEN ONLY / CAN TX DISABLED / FILE LOGGING DISABLED");}
+void setup(){Serial.begin(115200);delay(1200);Serial.println("\nEXEED CAN LAB v3.0 / ESP32-S3 / LOCAL ONLY");canReady=initializeCAN();startWiFi();server.on("/",HTTP_GET,handleRoot);server.on("/api/data",HTTP_GET,handleApi);server.onNotFound([](){server.send(404,"text/plain","Not found");});server.begin();Serial.println("[WEB] http://192.168.4.1");}
+void loop(){receiveCAN();server.handleClient();if(millis()-lastStatus>=5000){lastStatus=millis();printStatus();}delay(1);}
