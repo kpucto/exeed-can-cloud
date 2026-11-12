@@ -214,7 +214,7 @@ static void handleApi(){
   uint32_t oldest=totalFrames>FRAME_BUFFER_SIZE?totalFrames-FRAME_BUFFER_SIZE+1:(totalFrames?1:0);
   uint32_t overwritten=(oldest&&since+1<oldest)?oldest-since-1:0,start=since+1,end=totalFrames;
   if(oldest&&start<oldest)start=oldest;
-  if(end>=start&&end-start+1>API_FRAME_LIMIT)start=end-API_FRAME_LIMIT+1;
+  if(end>=start&&end-start+1>API_FRAME_LIMIT)end=start+API_FRAME_LIMIT-1;
   uint32_t gap=start>since+1?start-since-1:0;
   uint32_t unique=0;for(const auto&s:ids)if(s.used)unique++;
   String out;out.reserve(26000);
