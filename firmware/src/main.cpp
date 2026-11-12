@@ -78,7 +78,7 @@ input,select,button{background:var(--p2);color:var(--txt);border:1px solid #3549
 <p class="hint">READ ONLY · TWAI LISTEN ONLY · CAN TX disabled · CAN FD не поддерживается.</p></main>
 <script>
 "use strict";
-const $=id=>document.getElementById(id),S={seq:0,frames:[],events:[],inventory:[],paused:false,A:null,B:null,gap:0,labels:JSON.parse(localStorage.getItem("exeedCanLabels")||"{}"),rate:0,rateAt:Date.now(),rateCount:0};
+const $=id=>document.getElementById(id),S={seq:0,frames:[],events:[],inventory:[],paused:false,A:null,B:null,autoBase:null,autoAction:null,gap:0,labels:JSON.parse(localStorage.getItem("exeedCanLabels")||"{}"),rate:0,rateAt:Date.now(),rateCount:0};
 const MAX=12000,pad=(n,w=2)=>Number(n).toString(16).toUpperCase().padStart(w,"0"),key=x=>(x.ext?"EXT":"STD")+":0x"+pad(x.id,x.ext?8:3),data=f=>f.data.map(v=>pad(v)).join(" ");
 function switchTab(t){document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.tab===t));document.querySelectorAll(".panel").forEach(p=>p.classList.toggle("active",p.id==="p-"+t));}
 document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
@@ -89,6 +89,37 @@ function drawLog(){if(S.paused)return;const q=parseHex($("fid").value),d=$("fdat
 function drawInventory(){const q=$("idq").value.toLowerCase(),sort=$("sort").value;let a=S.inventory.filter(x=>key(x).toLowerCase().includes(q)||(S.labels[key(x)]||"").toLowerCase().includes(q));a.sort((x,y)=>sort==="id"?x.id-y.id:sort==="period"?x.period-y.period:sort==="changes"?y.changed-x.changed:y.count-x.count);const b=$("inventory");b.textContent="";for(const x of a){const tr=document.createElement("tr"),k=key(x),vals=[k,x.ext?"EXT":"STD",x.count,x.period+" ms",x.min+"/"+x.max+" ms",x.changedBytes.join(", "),x.data.map(v=>pad(v)).join(" ")];vals.forEach((v,i)=>{const td=document.createElement("td");td.textContent=v;if(i===0){td.className="id";td.onclick=()=>{$("fid").value="0x"+pad(x.id,x.ext?8:3);switchTab("live");drawLog();};}tr.appendChild(td);});const td=document.createElement("td");td.contentEditable="true";td.textContent=S.labels[k]||"";td.onblur=()=>{S.labels[k]=td.textContent.trim();localStorage.setItem("exeedCanLabels",JSON.stringify(S.labels));};tr.appendChild(td);b.appendChild(tr);}}
 function drawSignals(){const sel=$("sigid"),old=sel.value,items=S.inventory.slice().sort((a,b)=>a.id-b.id);sel.textContent="";items.forEach(x=>{const o=document.createElement("option");o.value=(x.ext?"E":"S")+":"+x.id;o.textContent=key(x)+" · "+x.count+" кадров";sel.appendChild(o);});if(items.some(x=>(x.ext?"E":"S")+":"+x.id===old))sel.value=old;if(!sel.value&&items.length)sel.value=(items[0].ext?"E":"S")+":"+items[0].id;const parts=sel.value.split(":");if(parts.length!==2){$("sigsummary").textContent="Пока нет CAN ID.";$("sighist").textContent="Нет данных.";$("sigbits").textContent="";$("sigperiod").textContent="Нет данных.";return;}const ext=parts[0]==="E",id=Number(parts[1]),bi=Number($("sigbyte").value),arr=S.frames.filter(f=>f.id===id&&f.ext===ext&&f.dlc>bi),vals=arr.map(f=>f.data[bi]);if(!vals.length){$("sigsummary").textContent="В текущей сессии нет кадров с выбранным байтом.";$("sighist").textContent="Нет данных.";$("sigbits").textContent="";return;}let ones=Array(8).fill(0),toggles=Array(8).fill(0);for(let n=0;n<vals.length;n++){for(let b=0;b<8;b++){const v=(vals[n]>>b)&1;ones[b]+=v;if(n&&v!==((vals[n-1]>>b)&1))toggles[b]++;}}const uniq=new Map();vals.forEach(v=>uniq.set(v,(uniq.get(v)||0)+1));const sorted=[...uniq.entries()].sort((a,b)=>b[1]-a[1]);const min=Math.min(...vals),max=Math.max(...vals),last=vals[vals.length-1];$("sigsummary").innerHTML="Кадров: <b>"+vals.length+"</b><br>Мин/макс: <b>0x"+pad(min)+" / 0x"+pad(max)+"</b><br>Уникальных значений: <b>"+uniq.size+"</b><br>Последнее значение: <b>0x"+pad(last)+" ("+last+")</b><br>Изменений байта: <b>"+vals.filter((v,i)=>i&&v!==vals[i-1]).length+"</b>";$("sighist").textContent=sorted.slice(0,16).map(([v,n])=>"0x"+pad(v)+" : "+n+" ("+(100*n/vals.length).toFixed(1)+"%)").join(" · ");const bits=$("sigbits");bits.textContent="";for(let b=7;b>=0;b--){const d=document.createElement("div");d.className="bit";d.innerHTML="<b>"+b+"</b><small>1: "+(100*ones[b]/vals.length).toFixed(1)+"%</small><small>Δ: "+toggles[b]+"</small>";bits.appendChild(d);}const periods=[];for(let i=1;i<arr.length;i++)periods.push(arr[i].ts-arr[i-1].ts);periods.sort((a,b)=>a-b);const median=periods.length?periods[Math.floor(periods.length/2)]:0;$("sigperiod").textContent="Кадров: "+arr.length+" · Медианный интервал: "+median+" мс · Min: "+(periods[0]??0)+" мс · Max: "+(periods[periods.length-1]??0)+" мс";}
 $("sigid").onchange=drawSignals;$("sigbyte").onchange=drawSignals;$("sigrefresh").onclick=drawSignals;
+function autoPoint(){return {seq:S.seq,wall:new Date().toISOString()};}
+function autoStatus(){const b=S.autoBase,a=S.autoAction;$("autostatus").textContent=(b?"База: seq "+b.seq+" ("+new Date(b.wall).toLocaleTimeString()+")":"База не установлена")+(a?" · Действие: seq "+a.seq+" ("+new Date(a.wall).toLocaleTimeString()+")":" · Действие не отмечено");}
+function autoReset(){S.autoBase=S.autoAction=null;autoStatus();$("autocandidates").innerHTML="<tr><td colspan='7'>Эксперимент сброшен.</td></tr>";}
+function autoAnalyze(){
+ if(!S.autoBase||!S.autoAction||S.autoAction.seq<=S.autoBase.seq){$("autostatus").textContent="Сначала зафиксируй Базу, затем Действие.";return;}
+ const before=S.frames.filter(f=>f.seq>S.autoBase.seq&&f.seq<=S.autoAction.seq),after=S.frames.filter(f=>f.seq>S.autoAction.seq),groups=new Map();
+ for(const f of before.concat(after)){const k=(f.ext?"E":"S")+":"+f.id;let g=groups.get(k);if(!g){g={id:f.id,ext:f.ext,before:[],after:[]};groups.set(k,g);}if(f.seq<=S.autoAction.seq)g.before.push(f);else g.after.push(f);}
+ const rows=[];
+ for(const g of groups.values()){
+  if(g.before.length<3||g.after.length<3)continue;
+  for(let bi=0;bi<8;bi++){
+   const bv=g.before.filter(f=>f.dlc>bi).map(f=>f.data[bi]),av=g.after.filter(f=>f.dlc>bi).map(f=>f.data[bi]);
+   if(bv.length<3||av.length<3)continue;
+   for(let bit=0;bit<8;bit++){
+    const bp=100*bv.reduce((n,v)=>n+((v>>bit)&1),0)/bv.length,ap=100*av.reduce((n,v)=>n+((v>>bit)&1),0)/av.length,delta=ap-bp;
+    if(Math.abs(delta)<15)continue;
+    const score=Math.abs(delta)*Math.sqrt(Math.min(bv.length,av.length));
+    rows.push({g,bi,bit,bp,ap,delta,score,bn:bv.length,an:av.length});
+   }
+  }
+ }
+ rows.sort((a,b)=>b.score-a.score);const body=$("autocandidates");body.textContent="";
+ const top=rows.slice(0,100);
+ top.forEach(x=>{const tr=document.createElement("tr"),vals=[key(x.g), "B"+x.bi+" / bit "+x.bit,x.bp.toFixed(1)+"%",x.ap.toFixed(1)+"%",(x.delta>0?"+":"")+x.delta.toFixed(1),x.bn+" / "+x.an,x.score.toFixed(1)];vals.forEach(v=>{const td=document.createElement("td");td.textContent=v;tr.appendChild(td);});body.appendChild(tr);});
+ if(!top.length)body.innerHTML="<tr><td colspan='7'>Нет выраженных изменений. Проверь, что кадры поступают, увеличь время записи или повтори одно действие.</td></tr>";
+ const label=$("autolabel").value.trim()||"действие";
+ $("autostatus").textContent="«"+label+"» · до: "+before.length+" кадров · после: "+after.length+" кадров · кандидатов: "+rows.length+" · показано: "+top.length+".";
+}
+$("autobase").onclick=()=>{S.autoBase=autoPoint();S.autoAction=null;autoStatus();$("autocandidates").innerHTML="<tr><td colspan='7'>База записана. Выполни одно действие с климатом.</td></tr>";};
+$("autoaction").onclick=()=>{if(!S.autoBase){$("autostatus").textContent="Сначала нажми «База».";return;}S.autoAction=autoPoint();autoStatus();$("autocandidates").innerHTML="<tr><td colspan='7'>Действие записано. Подожди 3–5 секунд и запускай анализ.</td></tr>";};
+$("autoanalyze").onclick=autoAnalyze;$("autoreset").onclick=autoReset;
 function drawEvents(){const b=$("events");b.textContent="";S.events.forEach(e=>{const d=document.createElement("div");d.className="event";d.textContent=new Date(e.wall).toLocaleTimeString()+" · "+e.label+" · seq "+e.seq;b.appendChild(d);});}
 function mark(label){if(!label)return;S.events.push({label,wall:new Date().toISOString(),seq:S.seq,index:S.frames.length});drawEvents();counts();}
 function point(){return {index:S.frames.length,seq:S.seq,wall:new Date().toISOString()};}
