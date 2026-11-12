@@ -4,7 +4,7 @@
 #include <cstring>
 #include "driver/twai.h"
 
-// EXEED CAN LAB v3.1: local-only passive CAN capture.
+// EXEED CAN LAB v3.2: local-only passive CAN capture.
 // No cloud, no STA, no filesystem logging, no CAN transmit or diagnostics.
 static constexpr gpio_num_t CAN_TX_PIN=GPIO_NUM_4, CAN_RX_PIN=GPIO_NUM_5;
 static constexpr size_t FRAME_BUFFER_SIZE=512, ID_STATS_SIZE=128;
@@ -57,7 +57,7 @@ input,select,button{background:var(--p2);color:var(--txt);border:1px solid #3549
 .panel{display:none}.panel.active{display:block}.tablewrap{overflow:auto;max-height:430px;border:1px solid var(--line);border-radius:8px}table{width:100%;border-collapse:collapse;white-space:nowrap;font:12px ui-monospace,monospace}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}th{position:sticky;top:0;background:#17243a;color:var(--muted)}td.id{color:var(--blue)}.pill{border:1px solid var(--line);border-radius:20px;padding:4px 9px}.event{border-left:3px solid var(--amber);padding:7px 10px;margin:6px 0;background:#101a2b}.heat{display:grid;grid-template-columns:repeat(8,minmax(28px,1fr));gap:6px}.bit{padding:9px 3px;text-align:center;border:1px solid var(--line);border-radius:8px;background:var(--p2)}.bit b{display:block;font-size:17px}.bit small{color:var(--muted);font-size:10px}.signalgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}@media(max-width:700px){.signalgrid{grid-template-columns:1fr}}
 @media(max-width:700px){main{padding:9px}.stats{grid-template-columns:repeat(2,1fr)}.metric{font-size:20px}h1{font-size:18px}}
 </style></head><body><main>
-<header><div><h1>EXEED CAN LAB <span class="pill">v3.1 LOCAL</span></h1><div class="hint">ESP32-S3 · 500 kbit/s · пассивное чтение · без интернета</div></div><span class="pill" id="link">Соединение…</span></header>
+<header><div><h1>EXEED CAN LAB <span class="pill">v3.2 LOCAL</span></h1><div class="hint">ESP32-S3 · 500 kbit/s · пассивное чтение · без интернета</div></div><span class="pill" id="link">Соединение…</span></header>
 <section class="stats">
 <div class="card"><div class="muted">CAN</div><div class="metric" id="can">…</div></div><div class="card"><div class="muted">Всего кадров</div><div class="metric" id="total">0</div></div>
 <div class="card"><div class="muted">Уникальных ID</div><div class="metric" id="unique">0</div></div><div class="card"><div class="muted">Кадров в браузере</div><div class="metric" id="client">0</div></div></section>
@@ -161,6 +161,6 @@ static void handleApi(){
   out+="]}";server.sendHeader("Cache-Control","no-store");server.send(200,"application/json; charset=utf-8",out);
 }
 static void startWiFi(){WiFi.mode(WIFI_AP);WiFi.setSleep(false);bool ok=WiFi.softAP(AP_SSID,AP_PASSWORD,6,false,4);Serial.printf("[WIFI] AP %s SSID=%s IP=%s\n",ok?"READY":"FAILED",AP_SSID,WiFi.softAPIP().toString().c_str());}
-static void printStatus(){updateCANStatus();uint32_t n=0;for(const auto&s:ids)if(s.used)n++;Serial.println("\n===== EXEED CAN LAB v3.1 =====");Serial.printf("CAN=%s frames=%lu uniqueIDs=%lu\n",canState.c_str(),(unsigned long)totalFrames,(unsigned long)n);Serial.printf("TWAI RX=%lu TX=%lu BUS=%lu MISSED=%lu OVERRUN=%lu TX_FAILED=%lu\n",(unsigned long)rxErrors,(unsigned long)txErrors,(unsigned long)busErrors,(unsigned long)rxMissed,(unsigned long)rxOverrun,(unsigned long)txFailed);Serial.printf("AP=%s IP=%s\n",AP_SSID,WiFi.softAPIP().toString().c_str());Serial.println("LISTEN ONLY / CAN TX DISABLED / FILE LOGGING DISABLED");}
-void setup(){Serial.begin(115200);delay(1200);Serial.println("\nEXEED CAN LAB v3.1 / ESP32-S3 / LOCAL ONLY");canReady=initializeCAN();startWiFi();server.on("/",HTTP_GET,handleRoot);server.on("/api/data",HTTP_GET,handleApi);server.onNotFound([](){server.send(404,"text/plain","Not found");});server.begin();Serial.println("[WEB] http://192.168.4.1");}
+static void printStatus(){updateCANStatus();uint32_t n=0;for(const auto&s:ids)if(s.used)n++;Serial.println("\n===== EXEED CAN LAB v3.2 =====");Serial.printf("CAN=%s frames=%lu uniqueIDs=%lu\n",canState.c_str(),(unsigned long)totalFrames,(unsigned long)n);Serial.printf("TWAI RX=%lu TX=%lu BUS=%lu MISSED=%lu OVERRUN=%lu TX_FAILED=%lu\n",(unsigned long)rxErrors,(unsigned long)txErrors,(unsigned long)busErrors,(unsigned long)rxMissed,(unsigned long)rxOverrun,(unsigned long)txFailed);Serial.printf("AP=%s IP=%s\n",AP_SSID,WiFi.softAPIP().toString().c_str());Serial.println("LISTEN ONLY / CAN TX DISABLED / FILE LOGGING DISABLED");}
+void setup(){Serial.begin(115200);delay(1200);Serial.println("\nEXEED CAN LAB v3.2 / ESP32-S3 / LOCAL ONLY");canReady=initializeCAN();startWiFi();server.on("/",HTTP_GET,handleRoot);server.on("/api/data",HTTP_GET,handleApi);server.onNotFound([](){server.send(404,"text/plain","Not found");});server.begin();Serial.println("[WEB] http://192.168.4.1");}
 void loop(){receiveCAN();server.handleClient();if(millis()-lastStatus>=5000){lastStatus=millis();printStatus();}delay(1);}
