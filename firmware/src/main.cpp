@@ -78,7 +78,7 @@ const MAX=12000,pad=(n,w=2)=>Number(n).toString(16).toUpperCase().padStart(w,"0"
 function switchTab(t){document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.tab===t));document.querySelectorAll(".panel").forEach(p=>p.classList.toggle("active",p.id==="p-"+t));}
 document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 function parseHex(s){s=s.trim().toLowerCase().replace(/^0x/,"");return s?(/^[0-9a-f]+$/.test(s)?parseInt(s,16):NaN):null;}
-function addFrame(f){S.frames.push(f);if(S.frames.length>MAX)S.frames.splice(0,S.frames.length-MAX);}
+function addFrame(f){S.frames.push(f);if(S.frames.length>MAX){const n=S.frames.length-MAX;S.frames.splice(0,n);if(S.A)S.A.index=Math.max(0,S.A.index-n);if(S.B)S.B.index=Math.max(0,S.B.index-n);S.events.forEach(e=>e.index=Math.max(0,e.index-n));}}
 function counts(){$("client").textContent=S.frames.length.toLocaleString();$("ecount").textContent=S.frames.length;$("evcount").textContent=S.events.length;}
 function drawLog(){if(S.paused)return;const q=parseHex($("fid").value),d=$("fdata").value.replace(/\s/g,"").toUpperCase(),t=$("ftype").value;const list=S.frames.slice(-250).reverse().filter(f=>(q===null||(!Number.isNaN(q)&&f.id===q))&&(t==="ALL"||f.ext===(t==="EXT"))&&(!d||data(f).replace(/\s/g,"").includes(d)));const b=$("log");b.textContent="";for(const f of list){const tr=document.createElement("tr");[f.seq,f.ts,key(f),f.ext?"EXT":"STD",f.dlc,data(f)+(f.rtr?" RTR":"")].forEach((v,i)=>{const td=document.createElement("td");td.textContent=v;if(i===2)td.className="id";tr.appendChild(td)});b.appendChild(tr);}if(!list.length)b.innerHTML="<tr><td colspan='6'>Нет кадров по фильтру</td></tr>";}
 function drawInventory(){const q=$("idq").value.toLowerCase(),sort=$("sort").value;let a=S.inventory.filter(x=>key(x).toLowerCase().includes(q)||(S.labels[key(x)]||"").toLowerCase().includes(q));a.sort((x,y)=>sort==="id"?x.id-y.id:sort==="period"?x.period-y.period:sort==="changes"?y.changed-x.changed:y.count-x.count);const b=$("inventory");b.textContent="";for(const x of a){const tr=document.createElement("tr"),k=key(x),vals=[k,x.ext?"EXT":"STD",x.count,x.period+" ms",x.min+"/"+x.max+" ms",x.changedBytes.join(", "),x.data.map(v=>pad(v)).join(" ")];vals.forEach((v,i)=>{const td=document.createElement("td");td.textContent=v;if(i===0){td.className="id";td.onclick=()=>{$("fid").value="0x"+pad(x.id,x.ext?8:3);switchTab("live");drawLog();};}tr.appendChild(td);});const td=document.createElement("td");td.contentEditable="true";td.textContent=S.labels[k]||"";td.onblur=()=>{S.labels[k]=td.textContent.trim();localStorage.setItem("exeedCanLabels",JSON.stringify(S.labels));};tr.appendChild(td);b.appendChild(tr);}}
@@ -105,11 +105,13 @@ static void handleRoot(){server.send_P(200,"text/html; charset=utf-8",HTML);}
 static void handleApi(){
   updateCANStatus();uint32_t since=server.hasArg("since")?strtoul(server.arg("since").c_str(),nullptr,10):0;
   uint32_t oldest=totalFrames>FRAME_BUFFER_SIZE?totalFrames-FRAME_BUFFER_SIZE+1:(totalFrames?1:0);
-  uint32_t lost=(oldest&&since+1<oldest)?oldest-since-1:0,start=since+1,end=totalFrames;
-  if(oldest&&start<oldest)start=oldest;if(end>=start&&end-start+1>API_FRAME_LIMIT)start=end-API_FRAME_LIMIT+1;
+  uint32_t overwritten=(oldest&&since+1<oldest)?oldest-since-1:0,start=since+1,end=totalFrames;
+  if(oldest&&start<oldest)start=oldest;
+  if(end>=start&&end-start+1>API_FRAME_LIMIT)start=end-API_FRAME_LIMIT+1;
+  uint32_t gap=start>since+1?start-since-1:0;
   uint32_t unique=0;for(const auto&s:ids)if(s.used)unique++;
   String out;out.reserve(26000);
-  out="{\"canState\":\""+canState+"\",\"totalFrames\":"+String(totalFrames)+",\"uniqueIds\":"+String(unique)+",\"boardLost\":"+String(lost)+",\"gap\":"+String(lost)+
+  out="{\"canState\":\""+canState+"\",\"totalFrames\":"+String(totalFrames)+",\"uniqueIds\":"+String(unique)+",\"boardLost\":"+String(overwritten)+",\"gap\":"+String(gap)+
     ",\"rxErrors\":"+String(rxErrors)+",\"txErrors\":"+String(txErrors)+",\"busErrors\":"+String(busErrors)+",\"rxMissed\":"+String(rxMissed)+",\"rxOverrun\":"+String(rxOverrun)+",\"txFailed\":"+String(txFailed)+",\"framesList\":[";
   bool first=true;for(uint32_t seq=start;seq<=end&&seq;seq++){const CanFrame&f=frames[(seq-1)%FRAME_BUFFER_SIZE];if(f.seq!=seq)continue;if(!first)out+=",";first=false;
     out+="{\"seq\":"+String(f.seq)+",\"ts\":"+String(f.ts)+",\"id\":"+String(f.id)+",\"dlc\":"+String(f.dlc)+",\"ext\":"+String(f.ext?"true":"false")+",\"rtr\":"+String(f.rtr?"true":"false")+",\"data\":[";
